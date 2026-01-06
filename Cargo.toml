@@ -2,5 +2,10 @@
 name = "systemd-user-timers-lib"
 version = "1.1.0"
 edition = "2024"
+license = "MIT"
+description = "A simple way to make systemd user timers. This is the library, not the CLI."
+repository = "https://github.com/galacticSystemsInDevelopment/systemd-user-timers-lib"
+license = "MIT"
+homepage = "https://systemd-user-timers.galacticsystemsindevelopment.xyz"
 
 [dependencies]
