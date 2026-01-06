@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 mod add_timer;
 mod disable;
 mod enable;
