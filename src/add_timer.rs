@@ -5,161 +5,107 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use crate::timers::Timer;
 
-pub fn add_timer(timer: Timer) -> String {
-    // Implementation to add the timer to the system
+
+pub fn add_timer(timer: Timer) -> Result<String, std::io::Error> {
     let mut log_output = String::new();
-    log_output.push_str(&format!("Adding timer: {:?}\n", timer));
+    
+    // Defaulting basic required strings
+    let timer_name = timer.name.as_deref().unwrap_or("default_timer");
+    let schedule = timer.schedule.as_deref().unwrap_or("*:*:*");
+    
+    // Handling Option<bool> with unwrap_or
+    let recurring = timer.recurring.unwrap_or(false);
+    let remain_line = if recurring { "RemainAfterElapse=yes" } else { "RemainAfterElapse=no" };
 
-    let remain_line = if timer.recurring {
-        "RemainAfterElapse=yes"
-    } else {
-        "RemainAfterElapse=no" // Or omit to use default
-    };
+    let description_line = timer.description.as_ref()
+        .map(|d| format!("Description={}", d))
+        .unwrap_or_default();
 
-    let description_line = if let Some(ref desc) = timer.description {
-        format!("Description={}", desc)
+    let (service_contents_opt, service_unit_name) = if timer.already_made_service.unwrap_or(false) {
+        (None, timer.service.clone().unwrap_or_else(|| timer_name.to_string()))
     } else {
-        String::new()
-    };
-
-    // If we need to create a service, build its ExecStart line from executable
-    let (service_contents_opt, service_unit_name) = if timer.already_made_service {
-        (None, timer.service.clone().unwrap_or_else(|| timer.name.clone()))
-    } else {
-        // executable must be present unless already_made_service was true
         let exe = timer.executable.as_ref().expect("executable required to create service");
         let esc = exe.replace('\'', "'\\''");
         let exec_start_line = format!("ExecStart=/bin/sh -c '{}'", esc);
 
-        // Service Type depends on normal_service: simple if normal_service, oneshot otherwise
-        let service_type_line = if timer.normal_service {
-            "Type=simple"
-        } else {
-            "Type=oneshot"
-        };
-        let restart_line = if timer.normal_service { "Restart=on-failure" } else { "Restart=no" };
+        let is_normal = timer.normal_service.unwrap_or(false);
+        let service_type = if is_normal { "Type=simple" } else { "Type=oneshot" };
+        let restart = if is_normal { "Restart=on-failure" } else { "Restart=no" };
 
         let mut svc = String::new();
         svc.push_str("[Unit]\n");
-        if !description_line.is_empty() {
-            svc.push_str(&format!("{}\n", description_line));
-        }
+        if !description_line.is_empty() { svc.push_str(&format!("{}\n", description_line)); }
         svc.push_str("\n[Service]\n");
-        svc.push_str(&format!("{}\n{}\n{}\n", service_type_line, exec_start_line, restart_line));
+        svc.push_str(&format!("{}\n{}\n{}\n", service_type, exec_start_line, restart));
         svc.push_str("\n[Install]\nWantedBy=default.target\n");
 
-        let unit_name = timer.service.clone().unwrap_or_else(|| timer.name.clone());
+        let unit_name = timer.service.clone().unwrap_or_else(|| timer_name.to_string());
         (Some(svc), unit_name)
     };
 
-    let persistent_line = if timer.exec_if_missed { "Persistent=yes" } else { "Persistent=no" };
-    let timer_trigger_line = if timer.on_calendar {
-        format!("OnCalendar={}", timer.schedule)
-    } else if timer.from_boot {
-        format!("OnBootSec={}", timer.schedule)
-    } else if timer.recurring {
-        format!("OnUnitActiveSec={}", timer.schedule)
+    let persistent = if timer.exec_if_missed.unwrap_or(false) { "Persistent=yes" } else { "Persistent=no" };
+    
+    let trigger = if timer.on_calendar.unwrap_or(false) {
+        format!("OnCalendar={}", schedule)
+    } else if timer.from_boot.unwrap_or(false) {
+        format!("OnBootSec={}", schedule)
+    } else if recurring {
+        format!("OnUnitActiveSec={}", schedule)
     } else {
-        format!("OnActiveSec={}", timer.schedule)
+        format!("OnActiveSec={}", schedule)
     };
 
-    // timer references the chosen service unit name
     let timer_contents = format!(
         "[Unit]\nDescription=Timer for {}\n\n[Timer]\nUnit={}.service\n{}\n{}\n{}\n\n[Install]\nWantedBy=timers.target\n",
-        timer.name, service_unit_name, timer_trigger_line, persistent_line, remain_line
+        timer_name, service_unit_name, trigger, persistent, remain_line
     );
 
-    // determine user systemd unit directory:
-    // prefer XDG_CONFIG_HOME when set and non-empty,
-    // otherwise fall back to $HOME/.config,
-    // otherwise use "~/.config/systemd/user" as a final fallback.
+    // XDG directory resolution
     let unit_dir = match env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty()) {
         Some(xdg) => format!("{}/systemd/user", xdg),
         None => match env::var("HOME").ok().filter(|s| !s.is_empty()) {
             Some(home) => format!("{}/.config/systemd/user", home),
-            None => "~/.config/systemd/user".to_string(),
+            None => "/tmp/systemd/user".to_string(), // Safer fallback than raw "~"
         },
     };
 
-    if let Err(e) = fs::create_dir_all(&unit_dir) {
-        log_output.push_str(&format!("Failed to create user systemd unit dir {}: {}", unit_dir, e));
-        return log_output;
-    }
+    fs::create_dir_all(&unit_dir)?;
 
-    // service unit filename is based on service_unit_name
-    let service_path = format!("{}/{}.service", unit_dir, service_unit_name);
-    let timer_path = format!("{}/{}.timer", unit_dir, timer.name);
-
-    // only write service file when we created it (not already-made)
+    let timer_path = format!("{}/{}.timer", unit_dir, timer_name);
     if let Some(svc) = service_contents_opt {
-        if let Err(e) = fs::write(&service_path, svc) {
-            log_output.push_str(&format!("Failed to write {}: {}", service_path, e));
-            return log_output;
-        }
+        let svc_path = format!("{}/{}.service", unit_dir, service_unit_name);
+        fs::write(svc_path, svc)?;
     }
-    if let Err(e) = fs::write(&timer_path, timer_contents) {
-        log_output.push_str(&format!("Failed to write {}: {}", timer_path, e));
-        return log_output;
-    }
+    fs::write(&timer_path, timer_contents)?;
 
-    // record single-use promise by appending to .single_use.txt if requested
-    if timer.single_use {
+    // Handle single-use promise
+    if timer.single_use.unwrap_or(false) {
         let su_path = format!("{}/.single_use.txt", unit_dir);
-        let mut already = false;
-        if let Ok(content) = fs::read_to_string(&su_path) {
-            for line in content.lines() {
-                if line.trim() == timer.name {
-                    already = true;
-                    break;
-                }
-            }
-        }
-        if !already {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&su_path) {
-                if let Err(e) = writeln!(f, "{}", timer.name) {
-                    log_output.push_str(&format!("Failed to write single-use promise {}: {}", su_path, e));
-                }
-            } else {
-                log_output.push_str(&format!("Failed to open {}", su_path));
-            }
-        }
+        let mut f = OpenOptions::new().create(true).append(true).open(su_path)?;
+        writeln!(f, "{}", timer_name)?;
     }
 
-    // reload using the user systemd instance
-    let reload_output = Command::new("systemctl").args(&["--user", "daemon-reload"]).status();
-    log_output.push_str(&format!("Reloading systemd user daemon: {:?}\n", reload_output));
-    // enable/start logic controlled by flags:
-    if timer.enable_at_login && timer.start_after_create {
-        match Command::new("systemctl")
-            .args(&["--user", "enable", "--now", &format!("{}.timer", timer.name)])
-            .status()
-        {
-            Ok(s) if s.success() => log_output.push_str(&format!("Enabled and started {}.timer (user)", timer.name)),
-            Ok(s) => log_output.push_str(&format!("systemctl returned status {:?}", s.code())),
-            Err(e) => log_output.push_str(&format!("Failed to enable/start timer: {}", e)),
-        }
-    } else if timer.enable_at_login {
-        match Command::new("systemctl")
-            .args(&["--user", "enable", &format!("{}.timer", timer.name)])
-            .status()
-        {
-            Ok(s) if s.success() => log_output.push_str(&format!("Enabled {}.timer (user)", timer.name)),
-            Ok(s) => log_output.push_str(&format!("systemctl returned status {:?}", s.code())),
-            Err(e) => log_output.push_str(&format!("Failed to enable timer: {}", e)),
-        }
-    } else if timer.start_after_create {
-        match Command::new("systemctl")
-            .args(&["--user", "start", &format!("{}.timer", timer.name)])
-            .status()
-        {
-            Ok(s) if s.success() => {
-                log_output.push_str(&format!("Started {}.timer (user)", timer.name));
-            },
-            Ok(s) => log_output.push_str(&format!("systemctl returned status {:?}", s.code())),
-            Err(e) => log_output.push_str(&format!("Failed to start timer: {}", e)),
-        }
-    } else {
-        log_output.push_str("Timer created but not enabled or started (flags not set).");
+    Command::new("systemctl").args(&["--user", "daemon-reload"]).status()?;
+
+    // Enable/Start logic
+    let enable = timer.enable_at_login.unwrap_or(false);
+    let start = timer.start_after_create.unwrap_or(false);
+
+    let mut args = vec!["--user"];
+    if enable && start { args.extend(&["enable", "--now"]); }
+    else if enable { args.push("enable"); }
+    else if start { args.push("start"); }
+    else {
+        log_output.push_str("Timer created (manual start required).");
+        return Ok(log_output);
     }
-    log_output
+
+    let unit_file = format!("{}.timer", timer_name);
+    args.push(&unit_file);
+
+    if Command::new("systemctl").args(&args).status()?.success() {
+        log_output.push_str(&format!("Successfully processed {}", unit_file));
+    }
+
+    Ok(log_output)
 }

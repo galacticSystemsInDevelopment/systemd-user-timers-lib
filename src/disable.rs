@@ -1,5 +1,4 @@
-pub fn disable(name: &str) -> Result<(), std::io::Error> {
-    let output_message = format!("Disabling timer: {}", name);
+pub fn disable(name: &str) -> Result<String, std::io::Error> {
     let timer_unit = format!("{}.timer", name);
     
     let output = std::process::Command::new("systemctl")
@@ -7,12 +6,18 @@ pub fn disable(name: &str) -> Result<(), std::io::Error> {
         .output()?;
 
     if output.status.success() {
-        println!("{} - Success: {}", output_message, String::from_utf8_lossy(&output.stdout));
+        // Concatenate the intent with the systemctl stdout
+        Ok(format!(
+            "Disabling timer: {} - Success: {}", 
+            name, 
+            String::from_utf8_lossy(&output.stdout).trim()
+        ))
     } else {
-        let error_message = String::from_utf8_lossy(&output.stderr);
-        println!("{} - Failed: {}", output_message, error_message);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, error_message.to_string()));
+        // Capture stderr for the error variant
+        let error_message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Disabling timer: {} - Failed: {}", name, error_message)
+        ))
     }
-
-    Ok(()) // Return Ok on success
 }
